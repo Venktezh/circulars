@@ -9,7 +9,7 @@ Two endpoints exist on BSE:
 
 Usage
 -----
-  python bse_circulars.py                          # today
+  python bse_circulars.py                          # uses FROM_DATE / TO_DATE below
   python bse_circulars.py --date 12/01/2026        # single date
   python bse_circulars.py --from 01/01/2026 --to 12/01/2026  # range
   python bse_circulars.py --date 12/01/2026 --out my_file.json
@@ -28,13 +28,13 @@ from html import unescape
 import requests
 
 # ── Date config (edit these) ─────────────────────────────────────────────────
-FROM_DATE = "01/01/2026"   # DD/MM/YYYY
-TO_DATE   = "12/01/2026"   # DD/MM/YYYY  (same as FROM_DATE for a single day)
+FROM_DATE = "12/01/2026"
+TO_DATE   = "12/01/2026"
 
-# ── Constants ────────────────────────────────────────────────────────────────
-BASE_URL     = "https://www.bseindia.com"
-RECENT_URL   = f"{BASE_URL}/markets/MarketInfo/NoticesCirculars.aspx"
-ARCHIVE_URL  = f"{BASE_URL}/markets/MarketInfo/NoticesCircularsArchive.aspx"
+# ── Constants ─────────────────────────────────────────────────────────────────
+BASE_URL    = "https://www.bseindia.com"
+RECENT_URL  = f"{BASE_URL}/markets/MarketInfo/NoticesCirculars.aspx"
+ARCHIVE_URL = f"{BASE_URL}/markets/MarketInfo/NoticesCircularsArchive.aspx"
 
 HEADERS = {
     "User-Agent": (
@@ -46,13 +46,13 @@ HEADERS = {
         "text/html,application/xhtml+xml,application/xml;"
         "q=0.9,image/avif,image/webp,*/*;q=0.8"
     ),
-    "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Connection":      "keep-alive",
+    "Accept-Language":           "en-US,en;q=0.9",
+    "Accept-Encoding":           "gzip, deflate, br",
+    "Connection":                "keep-alive",
     "Upgrade-Insecure-Requests": "1",
 }
 
-NOTICE_PATTERN = re.compile(r"^\d{8}-\d+$")   # e.g. 20260318-49
+NOTICE_PATTERN = re.compile(r"^\d{8}-\d+$")
 FMT = "%d/%m/%Y"
 
 
@@ -79,7 +79,6 @@ def extract_hidden(html: str) -> dict:
 
 
 def pdf_url_from_notice(notice_no: str) -> str:
-    """Construct the canonical BSE PDF URL from a notice number."""
     return f"{BASE_URL}/downloads/UploadDocs/Notices/{notice_no}/{notice_no}.pdf"
 
 
@@ -100,7 +99,6 @@ def _parse_rows(rows: list) -> list:
         category = strip_tags(cells[3])
         dept     = strip_tags(cells[4])
 
-        # Try direct PDF href first, then construct from notice_no
         pdf_m = re.search(r'href="([^"]+\.pdf[^"]*)"', cells[1], re.I)
         if not pdf_m:
             for extra in cells[2:]:
@@ -116,7 +114,6 @@ def _parse_rows(rows: list) -> list:
             if pdf_url.startswith("/"):
                 pdf_url = BASE_URL + pdf_url
         else:
-            # POST responses have no direct PDF href — construct from notice_no
             pdf_url = pdf_url_from_notice(notice_no)
 
         results.append({
@@ -132,9 +129,8 @@ def _parse_rows(rows: list) -> list:
 
 def parse_html(html: str) -> list:
     """
-    Extract circulars from any BSE response layout.
-    GET  responses use ContentPlaceHolder1_GridView1
-    POST responses use ContentPlaceHolder1_GridView2
+    Try GridView1 (GET/default) then GridView2 (POST/filtered).
+    BSE uses GridView2 when a date filter has been applied.
     """
     for gv_id in ("ContentPlaceHolder1_GridView1",
                   "ContentPlaceHolder1_GridView2"):
@@ -147,25 +143,40 @@ def parse_html(html: str) -> list:
                               m.group(1), re.DOTALL | re.I)
             results = _parse_rows(rows)
             if results:
-                return results
+                return results, gv_id   # ← return which gridview was used
 
-    # Last resort — scan all tables
+    # Last resort
     results = []
-    for tbl in re.findall(r"<table[^>]*>(.*?)</table>",
-                          html, re.DOTALL | re.I):
+    for tbl in re.findall(r"<table[^>]*>(.*?)</table>", html, re.DOTALL | re.I):
         rows = re.findall(r"<tr[^>]*>(.*?)</tr>", tbl, re.DOTALL | re.I)
         results.extend(_parse_rows(rows))
-    return results
+    return results, None
 
 
-def get_pager_pages(html: str) -> list:
-    pager_m = re.search(
-        r'class="[^"]*GridPager[^"]*".*?<tr[^>]*>(.*?)</tr>',
+def get_pager_pages(html: str, gv_id: str) -> list:
+    """
+    Find pagination links inside the correct GridView.
+    BSE encodes apostrophes as &#39; in href attributes, so we must
+    unescape before applying the regex.
+    """
+    from html import unescape as _unescape
+
+    # Extract the specific gridview block first
+    gv_match = re.search(
+        rf'id="{re.escape(gv_id)}"[^>]*>(.*?)</table>',
         html, re.DOTALL | re.I,
-    )
-    if not pager_m:
-        return []
-    return re.findall(r'href="[^"]*Page\$(\d+)"', pager_m.group(1), re.I)
+    ) if gv_id else None
+
+    search_area = gv_match.group(1) if gv_match else html
+
+    # Unescape HTML entities so &#39; becomes ' before we search
+    search_area = _unescape(search_area)
+
+    # Match both href="...Page$N..." and __doPostBack('gv','Page$N')
+    pages = re.findall(r"Page\$(\d+)", search_area, re.I)
+
+    # Deduplicate and sort, exclude page 1 (already loaded)
+    return sorted(set(int(p) for p in pages if int(p) > 1))
 
 
 # ── HTTP ──────────────────────────────────────────────────────────────────────
@@ -176,41 +187,53 @@ def make_session() -> requests.Session:
 
 
 def get_page(session: requests.Session, url: str) -> str:
-    resp = session.get(url, params={"id": "0", "txtscripcd": "",
-                                    "pagecont": "", "subject": ""},
-                       timeout=30)
+    resp = session.get(
+        url,
+        params={"id": "0", "txtscripcd": "", "pagecont": "", "subject": ""},
+        timeout=30,
+    )
     resp.raise_for_status()
     return resp.text
 
 
-def post_filter(session: requests.Session, url: str, prev_html: str,
-                from_date: str, to_date: str,
-                event_target: str = "", event_arg: str = "") -> str:
+def post_filter(
+    session: requests.Session,
+    url: str,
+    prev_html: str,
+    from_date: str,
+    to_date: str,
+    event_target: str = "",
+    event_arg: str = "",
+    gv_id: str = "ctl00$ContentPlaceHolder1$GridView2",
+) -> str:
     hidden = extract_hidden(prev_html)
     data = {
-        "__EVENTTARGET":          event_target,
-        "__EVENTARGUMENT":        event_arg,
-        "__LASTFOCUS":            "",
-        "__VIEWSTATE":            hidden.get("__VIEWSTATE", ""),
-        "__VIEWSTATEGENERATOR":   hidden.get("__VIEWSTATEGENERATOR", ""),
-        "__VIEWSTATEENCRYPTED":   "",
-        "__EVENTVALIDATION":      hidden.get("__EVENTVALIDATION", ""),
-        "ctl00$ContentPlaceHolder1$hdnNoticeFilter":       "",
-        "ctl00$ContentPlaceHolder1$txtDate":               from_date,
-        "ctl00$ContentPlaceHolder1$hidCurrentDate":        "",
-        "ctl00$ContentPlaceHolder1$txtTodate":             to_date,
-        "ctl00$ContentPlaceHolder1$txtNoticeNo":           "",
-        "ctl00$ContentPlaceHolder1$GetQuote1_hdnCode":     "",
-        "ctl00$ContentPlaceHolder1$SmartSearch$hdnCode":   "",
+        "__EVENTTARGET":        event_target,
+        "__EVENTARGUMENT":      event_arg,
+        "__LASTFOCUS":          "",
+        "__VIEWSTATE":          hidden.get("__VIEWSTATE", ""),
+        "__VIEWSTATEGENERATOR": hidden.get("__VIEWSTATEGENERATOR", ""),
+        "__VIEWSTATEENCRYPTED": "",
+        "__EVENTVALIDATION":    hidden.get("__EVENTVALIDATION", ""),
+        "ctl00$ContentPlaceHolder1$hdnNoticeFilter":     "",
+        "ctl00$ContentPlaceHolder1$txtDate":             from_date,
+        "ctl00$ContentPlaceHolder1$hidCurrentDate":      "",
+        "ctl00$ContentPlaceHolder1$txtTodate":           to_date,
+        "ctl00$ContentPlaceHolder1$txtNoticeNo":         "",
+        "ctl00$ContentPlaceHolder1$GetQuote1_hdnCode":   "",
+        "ctl00$ContentPlaceHolder1$SmartSearch$hdnCode": "",
         "ctl00$ContentPlaceHolder1$SmartSearch$smartSearch": "",
-        "ctl00$ContentPlaceHolder1$hf_scripcode":          "",
-        "ctl00$ContentPlaceHolder1$txtSub":                "",
+        "ctl00$ContentPlaceHolder1$hf_scripcode":        "",
+        "ctl00$ContentPlaceHolder1$txtSub":              "",
     }
+
+    # Initial filter submit uses btnSubmit; pagination uses GridView event
     if not event_target:
         data["ctl00$ContentPlaceHolder1$btnSubmit"] = "Submit"
 
     resp = session.post(
-        url, data=data,
+        url,
+        data=data,
         headers={
             "Content-Type": "application/x-www-form-urlencoded",
             "Referer": url + "?id=0&txtscripcd=&pagecont=&subject=",
@@ -234,47 +257,82 @@ def page_default_date(html: str):
 
 
 # ── Core fetcher ──────────────────────────────────────────────────────────────
-def fetch_for_url(session: requests.Session, url: str,
-                  from_date: str, to_date: str) -> list:
+def fetch_for_url(
+    session: requests.Session,
+    url: str,
+    from_date: str,
+    to_date: str,
+) -> list:
     print(f"[*] Loading {url.split('/')[-1]} ...")
-    get_html    = get_page(session, url)
-    default_dt  = page_default_date(get_html)
-    from_dt     = parse_date(from_date)
-    to_dt       = parse_date(to_date)
+    get_html   = get_page(session, url)
+    default_dt = page_default_date(get_html)
+    from_dt    = parse_date(from_date)
+    to_dt      = parse_date(to_date)
 
     print(f"    Page default date : {fmt_date(default_dt) if default_dt else 'unknown'}")
 
-    # Use GET response directly only when it already shows the exact target day
     use_get = (from_dt == to_dt == default_dt)
     if use_get:
         print("    Date matches page default — using GET response directly.")
         html = get_html
+        all_rows, active_gv = parse_html(html)
+        print(f"    Page 1: {len(all_rows)} circulars")
     else:
         time.sleep(random.uniform(1.0, 2.0))
-        print(f"    POST filter: {from_date} -> {to_date}")
+        print(f"    POST filter: {from_date} → {to_date}")
         html = post_filter(session, url, get_html, from_date, to_date)
+        all_rows, active_gv = parse_html(html)
+        print(f"    Page 1: {len(all_rows)} circulars")
 
-    all_rows = parse_html(html)
-    print(f"    Page 1: {len(all_rows)} circulars")
+    if not active_gv:
+        print("    Warning: could not identify active GridView for pagination")
+        return all_rows
 
-    for pg in get_pager_pages(html):
+    # ── Pagination ────────────────────────────────────────────────────────────
+    # active_gv e.g. "ContentPlaceHolder1_GridView2"
+    # event target must be  "ctl00$ContentPlaceHolder1$GridView2"
+    page_event_target = "ctl00$" + active_gv.replace("_", "$", 1)
+
+    # Collect ALL page numbers visible across ALL pager renders
+    all_known_pages = set(get_pager_pages(html, active_gv))
+    print(f"    Pagination pages found: {sorted(all_known_pages)}")
+
+    # prev_html always = the most recent response — provides fresh ViewState
+    # IMPORTANT: BSE invalidates ViewState if date fields are missing on
+    # subsequent POSTs, so post_filter always re-sends from_date/to_date.
+    prev_html = html
+    seen_pages = {1}
+
+    page_queue = sorted(all_known_pages)
+    while page_queue:
+        pg = page_queue.pop(0)
+        if pg in seen_pages:
+            continue
+        seen_pages.add(pg)
+
         time.sleep(random.uniform(1.0, 2.0))
         print(f"    Fetching page {pg} ...")
-        html = post_filter(
-            session, url, html, from_date, to_date,
-            event_target="ctl00$ContentPlaceHolder1$GridView1",
+        prev_html = post_filter(
+            session, url, prev_html, from_date, to_date,
+            event_target=page_event_target,
             event_arg=f"Page${pg}",
         )
-        batch = parse_html(html)
+        batch, _ = parse_html(prev_html)
         print(f"    Page {pg}: {len(batch)} circulars")
         all_rows.extend(batch)
+
+        # New pages may appear in the pager after navigating (e.g. pages 4,5)
+        new_pages = get_pager_pages(prev_html, active_gv)
+        for np in new_pages:
+            if np not in seen_pages and np not in page_queue:
+                page_queue.append(np)
+        page_queue.sort()
 
     return all_rows
 
 
 # ── Routing ───────────────────────────────────────────────────────────────────
 def get_archive_cutoff(session: requests.Session):
-    """Archive page default date = last archived date (exclusive boundary for recent URL)."""
     try:
         html = get_page(session, ARCHIVE_URL)
         return page_default_date(html)
@@ -283,9 +341,8 @@ def get_archive_cutoff(session: requests.Session):
 
 
 def split_range(from_dt: date, to_dt: date, cutoff: date):
-    """Split [from_dt, to_dt] into (archive_range, recent_range) at cutoff."""
-    archive = (from_dt, min(to_dt, cutoff))       if from_dt <= cutoff else None
-    recent  = (max(from_dt, cutoff + timedelta(1)), to_dt) if to_dt > cutoff else None
+    archive = (from_dt, min(to_dt, cutoff))              if from_dt <= cutoff else None
+    recent  = (max(from_dt, cutoff + timedelta(1)), to_dt) if to_dt > cutoff  else None
     return archive, recent
 
 
@@ -298,24 +355,11 @@ def main():
         description="Fetch BSE Notices & Circulars for a date or date range."
     )
     grp = parser.add_mutually_exclusive_group()
-    grp.add_argument("--date",  metavar="DD/MM/YYYY", help="Single date (default: today)")
-    grp.add_argument("--from",  dest="from_date", metavar="DD/MM/YYYY", help="Start of range")
-    parser.add_argument("--to", dest="to_date",   metavar="DD/MM/YYYY", help="End of range")
-    parser.add_argument("--out", metavar="FILE",  help="Output JSON filename (auto if omitted)")
+    grp.add_argument("--date",  metavar="DD/MM/YYYY")
+    grp.add_argument("--from",  dest="from_date", metavar="DD/MM/YYYY")
+    parser.add_argument("--to", dest="to_date",   metavar="DD/MM/YYYY")
+    parser.add_argument("--out", metavar="FILE")
     args = parser.parse_args()
-
-    today = date.today()
-
-    def prompt_date(label: str, default: date) -> date:
-        default_str = fmt_date(default)
-        while True:
-            raw = input(f"  {label} [{default_str}]: ").strip()
-            if not raw:
-                return default
-            try:
-                return parse_date(raw)
-            except ValueError:
-                print("  Invalid format — use DD/MM/YYYY")
 
     if args.date:
         from_dt = to_dt = parse_date(args.date)
@@ -330,33 +374,30 @@ def main():
         from_dt = parse_date(FROM_DATE)
         to_dt   = parse_date(TO_DATE)
 
-    from_str = fmt_date(from_dt)
-    to_str   = fmt_date(to_dt)
-    CACHE_FILE = "bse_circulars_cache.json"          # ← single cache file
-    out_file = args.out or CACHE_FILE
+    from_str  = fmt_date(from_dt)
+    to_str    = fmt_date(to_dt)
+    out_file  = args.out or "bse_circulars_cache.json"
 
-    print(f"[*] Date range : {from_str}  ->  {to_str}")
+    print(f"[*] Date range : {from_str}  →  {to_str}")
     print(f"[*] Output     : {out_file}")
 
     session = make_session()
     all_circulars = []
 
-    # Detect archive/recent boundary dynamically
     print("[*] Detecting archive cutoff ...")
     cutoff = get_archive_cutoff(session)
     if cutoff:
-        print(f"    Archive covers dates up to (and including): {fmt_date(cutoff)}")
+        print(f"    Archive covers up to (and including): {fmt_date(cutoff)}")
     else:
         print("    Could not detect cutoff — treating all dates as recent.")
-        cutoff = from_dt - timedelta(days=1)   # no-archive fallback
+        cutoff = from_dt - timedelta(days=1)
 
     time.sleep(random.uniform(0.8, 1.5))
-
     archive_range, recent_range = split_range(from_dt, to_dt, cutoff)
 
     if archive_range:
         a_from, a_to = archive_range
-        print(f"\n[*] Archive: {fmt_date(a_from)} -> {fmt_date(a_to)}")
+        print(f"\n[*] Archive range: {fmt_date(a_from)} → {fmt_date(a_to)}")
         rows = fetch_for_url(session, ARCHIVE_URL, fmt_date(a_from), fmt_date(a_to))
         all_circulars.extend(rows)
         if recent_range:
@@ -364,11 +405,11 @@ def main():
 
     if recent_range:
         r_from, r_to = recent_range
-        print(f"\n[*] Recent: {fmt_date(r_from)} -> {fmt_date(r_to)}")
+        print(f"\n[*] Recent range: {fmt_date(r_from)} → {fmt_date(r_to)}")
         rows = fetch_for_url(session, RECENT_URL, fmt_date(r_from), fmt_date(r_to))
         all_circulars.extend(rows)
 
-    # De-duplicate and sort descending by notice_no
+    # Deduplicate + sort descending
     seen, unique = set(), []
     for c in all_circulars:
         if c["notice_no"] not in seen:
@@ -389,7 +430,7 @@ def main():
         print(f"      Dept     : {c['department']}")
         print(f"      PDF      : {c['pdf_url']}")
 
-    # Save — merge new results into the cache file (no duplicates)
+    # Merge into cache file
     try:
         with open(out_file, encoding="utf-8") as f:
             cache = json.load(f)
@@ -403,7 +444,7 @@ def main():
 
     with open(out_file, "w", encoding="utf-8") as f:
         json.dump(cache, f, indent=2, ensure_ascii=False)
-    print(f"\n[+] {len(added)} new  |  {len(cache)} total in cache -> {out_file}")
+    print(f"\n[+] {len(added)} new  |  {len(cache)} total in cache → {out_file}")
 
 
 if __name__ == "__main__":
